@@ -33,12 +33,6 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal, Qt, QPoint, QSize, QThread, QTimer
 from PyQt6.QtGui import  QAction, QBrush, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut
 
-# ── Local depends/ path (standalone) ────────────────────────────────────────
-import os as _os, sys as _sys
-_depends = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'depends')
-if _depends not in _sys.path:
-    _sys.path.insert(0, _depends)
-
 try:
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtGui import QSurfaceFormat
@@ -56,14 +50,10 @@ except Exception:
     print("[ModelViewer] PyOpenGL not available — install python3-opengl")
 
 try:
-    from imgfactory_svg_icons import SVGIconFactory
+    from apps.methods.imgfactory_svg_icons import SVGIconFactory
     ICONS_AVAILABLE = True
 except ImportError:
-    try:
-        from apps.methods.imgfactory_svg_icons import SVGIconFactory
-        ICONS_AVAILABLE = True
-    except ImportError:
-        ICONS_AVAILABLE = False
+    ICONS_AVAILABLE = False
 
 
 # - Detect standalone vs docked
@@ -112,10 +102,7 @@ except ImportError:
         def close_icon(s=20, c='#fff'): return QIcon()
 
 try:
-    try:
-        from app_settings_system import AppSettings, SettingsDialog
-    except ImportError:
-        from apps.utils.app_settings_system import AppSettings, SettingsDialog
+    from apps.utils.app_settings_system import AppSettings, SettingsDialog
     APPSETTINGS_AVAILABLE = True
 except ImportError:
     APPSETTINGS_AVAILABLE = False
