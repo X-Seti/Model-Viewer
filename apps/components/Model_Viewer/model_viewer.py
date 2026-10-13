@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#this belongs in apps/components/Model_Viewer/model_viewer.py - Version: 2
+#this belongs in apps/components/Model_Viewer/model_viewer.py - Version: 5
 # X-Seti - May10 2026 - IMG Factory 1.6 - DFF Model Viewer
 """
 DFF Model Viewer - OpenGL hardware 3D viewer for GTA RenderWare DFF files.
@@ -8,13 +8,14 @@ Canvas: DFFViewport(QOpenGLWidget).
 View-only. Orbit/pan/zoom, wireframe/solid/textured, prelighting, light setup.
 """
 
-import os, json, sys, requests, threading, struct, re, math, shutil
+import os, json, sys, threading, struct, re, math, shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
-os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
-os.environ.setdefault('QSG_RHI_BACKEND',  'opengl')
+if sys.platform.startswith('linux'):   # xcb only exists on Linux
+    os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
+    os.environ.setdefault('QSG_RHI_BACKEND',  'opengl')
 
 #Adding Standalone
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +23,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from apps.methods.ribbon_system import RibbonMixin
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QFrame,
@@ -39,7 +41,6 @@ try:
     from OpenGL.GL  import *
     from OpenGL.GLU import *
     OPENGL_AVAILABLE = True
-    # Compatibility profile — required for fixed-function GL on Python 3.12+ / PyQt6
     _fmt = QSurfaceFormat()
     _fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
     _fmt.setVersion(2, 1)
@@ -48,6 +49,15 @@ except Exception:
     QOpenGLWidget      = QWidget
     OPENGL_AVAILABLE   = False
     print("[ModelViewer] PyOpenGL not available — install python3-opengl")
+
+# Shared DFFViewport — import from methods/, fallback to local methods/
+try:
+    from apps.methods.dff_viewport import DFFViewport
+except ImportError:
+    from apps.methods.dff_viewport import DFFViewport
+
+from apps.methods.ribbon_system import RibbonMixin
+from apps.methods.img_factory_settings import get_user_config_dir
 
 try:
     from apps.methods.imgfactory_svg_icons import SVGIconFactory
@@ -149,7 +159,7 @@ except ImportError:
 # - Settings
 class MVSettings:
     """Lightweight JSON settings for Model Viewer."""
-    _PATH = os.path.expanduser('~/.config/imgfactory/model_viewer.json')
+    _PATH = os.path.join(get_user_config_dir(), 'model_viewer.json')
 
     def __init__(self): #vers 1
         self._data = {}
@@ -263,533 +273,17 @@ class _CornerOverlay(QWidget):
             painter.drawPath(path)
         painter.end()
 
-# - OpenGL viewport
-class DFFViewport(QOpenGLWidget if OPENGL_AVAILABLE else QWidget):
-    """Hardware OpenGL viewport for DFF geometry."""
-
-    def __init__(self, parent=None): #vers 1
-        super().__init__(parent)
-        self.app_settings = None
-
-        self._vertices:  List  = []
-        self._normals:   List  = []
-        self._uvs:       List  = []
-        self._triangles: List  = []
-        self._materials: List  = []
-        self._prelit:    List  = []   # list of (r,g,b,a) 0-255
-        self._tex_ids:   Dict[str,int] = {}
-
-        # Camera
-        self._dist  = 10.0
-        self._yaw   = 45.0
-        self._pitch = 25.0
-        self._pan_x = 0.0
-        self._pan_y = 0.0
-
-        # Mouse
-        self._last_pos  = QPoint()
-        self._dragging  = False
-        self._drag_btn  = Qt.MouseButton.NoButton
-
-        # Render state
-        self._mode          = 'solid'
-        self._backface_cull = True
-        self._show_grid     = True
-        self._use_prelight  = False
-        self._assembly_mode = False
-        self._all_geoms     = []
-        self._show_lod      = False   # hide _vlo by default
-        # Vehicle paint preview colours (user can change via Light Setup or future colour picker)
-        self._paint1 = (0.80, 0.20, 0.20)  # primary   — default red
-        self._paint2 = (0.20, 0.20, 0.80)  # secondary — default blue
-        self._light_dir     = (1.0, 2.0, 1.5, 0.0)   # GL_POSITION homogeneous
-        self._ambient       = 0.30
-        self._diffuse       = 0.85
-
-        self.setMinimumSize(400, 300)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
-    def _get_ui_color(self, key): #vers 2
-        try:
-            if self.app_settings and hasattr(self.app_settings, 'get_ui_color'):
-                return self.app_settings.get_ui_color(key)
-        except Exception:
-            pass
-        defaults = {
-            'viewport_bg': QColor(18, 20, 28),
-            'grid':        QColor(45, 50, 65),
-        }
-        return defaults.get(key, QColor(200, 200, 200))
-
-
-    # - OpenGL lifecycle
-    def initializeGL(self): #vers 1
-        if not OPENGL_AVAILABLE: return
-        bg = self._get_ui_color('viewport_bg')
-        glClearColor(bg.redF(), bg.greenF(), bg.blueF(), 1.0)
-        glEnable(GL_DEPTH_TEST)
-        glDepthFunc(GL_LEQUAL)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glShadeModel(GL_SMOOTH)
-        glEnable(GL_NORMALIZE)
-        self._setup_lighting()
-
-    def _setup_lighting(self): #vers 1
-        glEnable(GL_LIGHTING)
-        glEnable(GL_LIGHT0)
-        glEnable(GL_COLOR_MATERIAL)
-        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
-        glLightfv(GL_LIGHT0, GL_POSITION, self._light_dir)
-        glLightfv(GL_LIGHT0, GL_AMBIENT,  [self._ambient]*3 + [1.0])
-        glLightfv(GL_LIGHT0, GL_DIFFUSE,  [self._diffuse]*3 + [1.0])
-        glLightfv(GL_LIGHT0, GL_SPECULAR, [0.15, 0.15, 0.15, 1.0])
-
-    def resizeGL(self, w, h): #vers 1
-        if not OPENGL_AVAILABLE: return
-        glViewport(0, 0, w, h)
-        glMatrixMode(GL_PROJECTION); glLoadIdentity()
-        aspect = w / h if h > 0 else 1.0
-        gluPerspective(45.0, aspect, 0.01, 50000.0)
-        glMatrixMode(GL_MODELVIEW)
-
-    def paintGL(self): #vers 2
-        if not OPENGL_AVAILABLE: return
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glLoadIdentity()
-        glTranslatef(self._pan_x, self._pan_y, -self._dist)
-        glRotatef(self._pitch, 1, 0, 0)
-        glRotatef(self._yaw,   0, 1, 0)
-
-        # Grid drawn in OpenGL world space (Y-up) — before GTA rotation
-        if self._show_grid:
-            self._draw_grid()
-
-        if not self._vertices:
-            if self._show_grid: self._draw_axes()
-            return
-
-        # GTA Z-up/Y-forward → OpenGL Y-up/Z-forward (model only)
-        glPushMatrix()
-        glRotatef(-90, 1, 0, 0)
-        if self._show_grid: self._draw_axes()
-
-        if self._backface_cull:
-            glEnable(GL_CULL_FACE); glCullFace(GL_BACK)
-        else:
-            glDisable(GL_CULL_FACE)
-
-        glLightfv(GL_LIGHT0, GL_POSITION, self._light_dir)
-
-        if getattr(self,'_assembly_mode',False) and getattr(self,'_all_geoms',[]):
-            self._draw_assembly()
-        elif self._mode == 'wireframe': self._draw_wireframe()
-        elif self._mode == 'solid':     self._draw_solid()
-        elif self._mode == 'textured':  self._draw_textured()
-        glPopMatrix()
-
-
-    # - draw calls
-    def _draw_grid(self): #vers 1
-        glDisable(GL_LIGHTING)
-        gc = self._get_ui_color('grid')
-        glColor3f(gc.redF(), gc.greenF(), gc.blueF())
-        glLineWidth(1.0)
-        step  = max(0.5, self._dist / 20.0)
-        count = 20; half = count * step
-        glBegin(GL_LINES)
-        for i in range(-count, count + 1):
-            p = i * step
-            glVertex3f(p, 0, -half); glVertex3f(p, 0,  half)
-            glVertex3f(-half, 0, p); glVertex3f( half, 0, p)
-        glEnd()
-
-    def _draw_axes(self): #vers 1
-        glDisable(GL_LIGHTING); glLineWidth(2.0)
-        r = self._dist * 0.15
-        glBegin(GL_LINES)
-        glColor3f(1,0,0); glVertex3f(0,0,0); glVertex3f(r,0,0)
-        glColor3f(0,1,0); glVertex3f(0,0,0); glVertex3f(0,r,0)
-        glColor3f(0,0,1); glVertex3f(0,0,0); glVertex3f(0,0,r)
-        glEnd()
-
-    def _face_color(self, mat_id): #vers 5
-        """Return (r,g,b,a) 0-1 for a material including alpha for glass/transparency."""
-        mats = self._materials
-        if mats and 0 <= mat_id < len(mats):
-            mat = mats[mat_id]
-            c = mat.colour
-            r=getattr(c,'r',180); g=getattr(c,'g',180); b=getattr(c,'b',180); a=getattr(c,'a',255)
-            has_tex = bool(getattr(mat,'texture_name',''))
-            if r==0 and g==0 and b==0 and not has_tex:
-                return 0.55, 0.55, 0.55, 1.0
-            if g==255 and r<100 and b<50:  # primary paint slot
-                return self._paint1[0], self._paint1[1], self._paint1[2], a/255
-            if r==255 and g<50 and b>100:  # secondary paint slot
-                return self._paint2[0], self._paint2[1], self._paint2[2], a/255
-            return r/255, g/255, b/255, a/255
-        return 0.7, 0.7, 0.7, 1.0
-
-    def _emit_verts(self, v1, v2, v3, use_prelit=False, use_uv=False): #vers 1
-        verts = self._vertices; norms = self._normals
-        uvs   = self._uvs;      prelit = self._prelit
-        has_n = len(norms)  == len(verts)
-        has_u = len(uvs)    == len(verts) and use_uv
-        has_p = len(prelit) == len(verts) and use_prelit
-        for vi in (v1, v2, v3):
-            if vi >= len(verts): continue
-            if has_p:
-                p = prelit[vi]
-                glColor3f(p[0]/255, p[1]/255, p[2]/255)
-            if has_n:
-                n = norms[vi]; glNormal3f(n[0], n[1], n[2])
-            if has_u:
-                u = uvs[vi]; glTexCoord2f(u[0], 1.0 - u[1])
-            v = verts[vi]; glVertex3f(v[0], v[1], v[2])
-
-    def _draw_wireframe(self): #vers 1
-        glDisable(GL_LIGHTING)
-        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-        glColor3f(0.65, 0.75, 1.0); glLineWidth(0.8)
-        glBegin(GL_TRIANGLES)
-        for v1,v2,v3,mid in self._triangles:
-            self._emit_verts(v1,v2,v3)
-        glEnd()
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-
-    def _draw_solid(self): #vers 2
-        glEnable(GL_LIGHTING)
-        use_p = self._use_prelight and self._prelit
-        # Opaque first, then transparent (alpha < 1) for correct blending
-        opaque=[]; transparent=[]
-        for tri in self._triangles:
-            fc=self._face_color(tri[3])
-            (transparent if len(fc)>3 and fc[3]<0.99 else opaque).append((tri,fc))
-        glBegin(GL_TRIANGLES)
-        for (v1,v2,v3,mid),(r,g,b,*rest) in opaque:
-            if not use_p: glColor4f(r,g,b,1.0)
-            self._emit_verts(v1,v2,v3, use_prelit=use_p)
-        glEnd()
-        if transparent:
-            glEnable(GL_BLEND); glDepthMask(False)
-            glBegin(GL_TRIANGLES)
-            for (v1,v2,v3,mid),(r,g,b,a) in transparent:
-                if not use_p: glColor4f(r,g,b,a)
-                self._emit_verts(v1,v2,v3, use_prelit=use_p)
-            glEnd()
-            glDepthMask(True); glDisable(GL_BLEND)
-
-        # Wireframe overlay
-        glDisable(GL_LIGHTING)
-        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-        glColor4f(0,0,0,0.18); glLineWidth(0.5)
-        glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1,-1)
-        glBegin(GL_TRIANGLES)
-        for v1,v2,v3,mid in self._triangles:
-            self._emit_verts(v1,v2,v3)
-        glEnd()
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-        glDisable(GL_POLYGON_OFFSET_LINE)
-
-    def _draw_textured(self): #vers 2
-        glEnable(GL_LIGHTING); glEnable(GL_TEXTURE_2D)
-        # GL_MODULATE: final = texture_colour * gl_colour (enables paint tinting)
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
-        use_p = self._use_prelight and self._prelit
-        mats  = self._materials
-
-        # Group triangles by (gl_tex_id, mat_colour) so we batch correctly
-        # Key: (gl_id, r, g, b) — same texture+colour batched together
-        batches: Dict[tuple,list] = {}
-        no_tex = []
-        for tri in self._triangles:
-            v1,v2,v3,mid = tri
-            tname = ''
-            if mats and 0 <= mid < len(mats):
-                tname = getattr(mats[mid],'texture_name','') or ''
-            gl_id = self._tex_ids.get(tname.lower(), 0)
-            if gl_id:
-                r,g,b,a = self._face_color(mid)
-                key = (gl_id, round(r,2), round(g,2), round(b,2), round(a,2))
-                batches.setdefault(key,[]).append(tri)
-            else:
-                no_tex.append(tri)
-
-        # Sort: opaque batches first, then transparent
-        opaque_b = {k:v for k,v in batches.items() if len(k)<5 or k[4]>=0.99}
-        transp_b = {k:v for k,v in batches.items() if len(k)>=5 and k[4]<0.99}
-        for batch_dict, use_blend in [(opaque_b,False),(transp_b,True)]:
-            if use_blend: glEnable(GL_BLEND); glDepthMask(False)
-            for key, tris in batch_dict.items():
-                gl_id=key[0]; r=key[1]; g=key[2]; b=key[3]
-                a = key[4] if len(key)>4 else 1.0
-                glBindTexture(GL_TEXTURE_2D, gl_id)
-                if not use_p: glColor4f(r, g, b, a)
-                glBegin(GL_TRIANGLES)
-                for v1,v2,v3,mid in tris:
-                    self._emit_verts(v1,v2,v3, use_prelit=use_p, use_uv=True)
-                glEnd()
-            if use_blend: glDepthMask(True); glDisable(GL_BLEND)
-
-        glBindTexture(GL_TEXTURE_2D, 0); glDisable(GL_TEXTURE_2D)
-        no_opaque=[t for t in no_tex if self._face_color(t[3])[3]>=0.99]
-        no_transp=[t for t in no_tex if self._face_color(t[3])[3]<0.99]
-        for tri_list, use_blend in [(no_opaque,False),(no_transp,True)]:
-            if use_blend: glEnable(GL_BLEND); glDepthMask(False)
-            for v1,v2,v3,mid in tri_list:
-                r,g,b,a = self._face_color(mid)
-                if not use_p: glColor4f(r,g,b,a)
-                glBegin(GL_TRIANGLES)
-                self._emit_verts(v1,v2,v3, use_prelit=use_p)
-                glEnd()
-            if use_blend: glDepthMask(True); glDisable(GL_BLEND)
-        glEnable(GL_TEXTURE_2D)
-
-
-    # - textures
-    def _upload_textures(self, textures: list): #vers 1
-        if not OPENGL_AVAILABLE: return
-        self.makeCurrent(); self.clear_textures()
-        for tex in textures:
-            name = tex.get('name','').lower()
-            rgba = tex.get('rgba_data', b'')
-            w    = tex.get('width', 0); h = tex.get('height', 0)
-            if not (name and rgba and w > 0 and h > 0): continue
-            gl_id = glGenTextures(1)
-            glBindTexture(GL_TEXTURE_2D, gl_id)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
-            try:
-                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,rgba)
-                glGenerateMipmap(GL_TEXTURE_2D)
-                self._tex_ids[name] = gl_id
-            except Exception as e:
-                print(f"[ModelViewer] Tex upload fail '{name}': {e}")
-                glDeleteTextures(1,[gl_id])
-        glBindTexture(GL_TEXTURE_2D, 0); self.doneCurrent()
-
-    def clear_textures(self): #vers 1
-        if OPENGL_AVAILABLE and self._tex_ids:
-            try: glDeleteTextures(len(self._tex_ids), list(self._tex_ids.values()))
-            except Exception: pass
-        self._tex_ids.clear()
-
-
-    # - public API
-    def load_geometry(self, geometry, materials: list): #vers 1
-        self._vertices  = [(v.x,v.y,v.z) for v in geometry.vertices]
-        self._normals   = [(n.x,n.y,n.z) for n in geometry.normals] if geometry.normals else []
-        self._uvs       = [(u.u,u.v) for u in geometry.uv_layers[0]] if geometry.uv_layers else []
-        self._triangles = [(t.v1,t.v2,t.v3,t.material_id) for t in geometry.triangles]
-        self._materials = materials
-        self._prelit    = [(c.r,c.g,c.b,c.a) for c in getattr(geometry,'colors',[])] if geometry.colors else []
-        self._auto_fit(); self.update()
-
-    def _auto_fit(self): #vers 1
-        if not self._vertices: return
-        xs=[v[0] for v in self._vertices]; ys=[v[1] for v in self._vertices]; zs=[v[2] for v in self._vertices]
-        diag = math.sqrt((max(xs)-min(xs))**2+(max(ys)-min(ys))**2+(max(zs)-min(zs))**2)
-        self._dist  = max(diag*1.5, 2.0)
-        self._pan_x = -(max(xs)+min(xs))/2
-        self._pan_y = -(max(ys)+min(ys))/2
-        self.update()
-
-    def set_render_mode(self, mode: str): #vers 1
-        self._mode = mode; self.update()
-
-    def set_backface_cull(self, v: bool): #vers 1
-        self._backface_cull = v; self.update()
-
-    def set_show_grid(self, v: bool): #vers 1
-        self._show_grid = v; self.update()
-
-    def load_all_geometries(self, geometries, materials_list, frames, atomics, damaged=False): #vers 2
-        # Load all geometries with world transforms. damaged=True shows _dam parts.
-        self._all_geoms = []
-        fname = {i: (f.name.lower() if f.name else '') for i,f in enumerate(frames)}
-        for i, geom in enumerate(geometries):
-            atomic = next((a for a in atomics if a.geometry_index == i), None)
-            if not atomic: continue
-            fi = atomic.frame_index
-            name = fname.get(fi, '')
-            is_dam = name.endswith('_dam')
-            is_ok  = name.endswith('_ok')
-            is_lod = name.endswith('_vlo') or name.endswith('_lo')
-            if is_dam and not damaged: continue
-            if is_ok  and damaged: continue
-            if is_lod and not getattr(self, '_show_lod', False): continue
-            rot, tx, ty, tz = self._calc_world_matrix(frames, fi)
-            verts = [(rot[0]*v.x+rot[1]*v.y+rot[2]*v.z+tx,
-                      rot[3]*v.x+rot[4]*v.y+rot[5]*v.z+ty,
-                      rot[6]*v.x+rot[7]*v.y+rot[8]*v.z+tz) for v in geom.vertices]
-            norms = [(rot[0]*n.x+rot[1]*n.y+rot[2]*n.z,
-                      rot[3]*n.x+rot[4]*n.y+rot[5]*n.z,
-                      rot[6]*n.x+rot[7]*n.y+rot[8]*n.z) for n in geom.normals] if geom.normals else []
-            uvs   = [(u.u,u.v) for u in geom.uv_layers[0]] if geom.uv_layers else []
-            tris  = [(t.v1,t.v2,t.v3,t.material_id) for t in geom.triangles]
-            prelit= [(c.r,c.g,c.b,c.a) for c in geom.colors] if geom.colors else []
-            self._all_geoms.append((verts,norms,uvs,tris,geom.materials,prelit))
-            # Wheel instancing: place at all wheel dummy frames
-            # Use wheels.DFF geometry if available, else repeat vehicle's own wheel mesh
-            if 'wheel' in name and not is_dam and not is_ok:
-                wheel_data = self._get_wheel_geom_data()
-                for fi2, fn2 in fname.items():
-                    if fi2 == fi: continue
-                    if 'wheel' in fn2 and 'dummy' in fn2:
-                        r2,tx2,ty2,tz2 = self._calc_world_matrix(frames, fi2)
-                        is_left = fn2.startswith('wheel_l')
-                        if wheel_data:
-                            wv,wn,wu,wt,wm,wp = wheel_data
-                            # Transform wheel.DFF verts to this dummy's world position
-                            v2=[(r2[0]*vx+r2[1]*vy+r2[2]*vz+tx2,
-                                 r2[3]*vx+r2[4]*vy+r2[5]*vz+ty2,
-                                 r2[6]*vx+r2[7]*vy+r2[8]*vz+tz2) for vx,vy,vz in wv]
-                            if is_left: v2=[(-vx,vy,vz) for vx,vy,vz in v2]
-                            self._all_geoms.append((v2,wn,wu,wt,wm,wp))
-                        else:
-                            # Fallback: repeat vehicle's own wheel mesh
-                            v2=[(r2[0]*v.x+r2[1]*v.y+r2[2]*v.z+tx2,
-                                 r2[3]*v.x+r2[4]*v.y+r2[5]*v.z+ty2,
-                                 r2[6]*v.x+r2[7]*v.y+r2[8]*v.z+tz2) for v in geom.vertices]
-                            if is_left: v2=[(-vx,vy,vz) for vx,vy,vz in v2]
-                            self._all_geoms.append((v2,norms,uvs,tris,geom.materials,prelit))
-        all_pts=[p for g in self._all_geoms for p in g[0]]
-        if all_pts:
-            xs=[p[0] for p in all_pts]; ys=[p[1] for p in all_pts]
-            diag=math.sqrt(max(1,(max(xs)-min(xs))**2+(max(ys)-min(ys))**2))
-            self._dist=max(diag*2.0,2.0)
-            self._pan_x=-(max(xs)+min(xs))/2; self._pan_y=-(max(ys)+min(ys))/2
-        self.update()
-
-    def _calc_world_matrix(self, frames, frame_idx): #vers 1
-        """Compute cumulative world matrix for a frame chain."""
-        r=[1,0,0,0,1,0,0,0,1]; tx=ty=tz=0.0
-        visited=set(); idx=frame_idx; chain=[]
-        while 0<=idx<len(frames) and idx not in visited:
-            visited.add(idx); chain.append(frames[idx]); idx=frames[idx].parent_index
-        for frame in reversed(chain):
-            fr=frame.rotation; fp=frame.position
-            nr=[r[0]*fr[0]+r[1]*fr[3]+r[2]*fr[6],r[0]*fr[1]+r[1]*fr[4]+r[2]*fr[7],r[0]*fr[2]+r[1]*fr[5]+r[2]*fr[8],
-                r[3]*fr[0]+r[4]*fr[3]+r[5]*fr[6],r[3]*fr[1]+r[4]*fr[4]+r[5]*fr[7],r[3]*fr[2]+r[4]*fr[5]+r[5]*fr[8],
-                r[6]*fr[0]+r[7]*fr[3]+r[8]*fr[6],r[6]*fr[1]+r[7]*fr[4]+r[8]*fr[7],r[6]*fr[2]+r[7]*fr[5]+r[8]*fr[8]]
-            ntx=r[0]*fp.x+r[1]*fp.y+r[2]*fp.z+tx; nty=r[3]*fp.x+r[4]*fp.y+r[5]*fp.z+ty
-            ntz=r[6]*fp.x+r[7]*fp.y+r[8]*fp.z+tz; r,tx,ty,tz=nr,ntx,nty,ntz
-        return r,tx,ty,tz
-
-
-    def load_wheels_dff(self, path: str, wheel_type: str = 'wheel_saloon_l0'): #vers 1
-        try:
-            from apps.methods.dff_parser import load_dff
-            self._wheels_model = load_dff(path)
-            self._wheel_type   = wheel_type
-        except Exception as e:
-            print(f'[wheels.DFF] {e}')
-
-    def _get_wheel_geom_data(self): #vers 1
-        """Return geometry tuple for current wheel type from wheels.DFF."""
-        m = getattr(self,'_wheels_model',None)
-        if not m: return None
-        wtype = getattr(self,'_wheel_type','wheel_saloon_l0').lower()
-        for a in m.atomics:
-            fi = a.frame_index
-            fname = (m.frames[fi].name or '').lower() if fi<len(m.frames) else ''
-            if fname == wtype:
-                g = m.geometries[a.geometry_index]
-                return (
-                    [(v.x,v.y,v.z) for v in g.vertices],
-                    [(n.x,n.y,n.z) for n in g.normals] if g.normals else [],
-                    [(u.u,u.v) for u in g.uv_layers[0]] if g.uv_layers else [],
-                    [(t.v1,t.v2,t.v3,t.material_id) for t in g.triangles],
-                    g.materials,
-                    [(c.r,c.g,c.b,c.a) for c in g.colors] if g.colors else []
-                )
-        return None
-
-    def set_assembly_mode(self, enabled: bool): #vers 1
-        self._assembly_mode = enabled; self.update()
-
-    def set_show_lod(self, enabled: bool): #vers 1
-        self._show_lod = enabled; self.update()
-
-    def _draw_assembly(self): #vers 1
-        """Draw all geometries at their world positions."""
-        if not OPENGL_AVAILABLE: return
-        for verts,norms,uvs,tris,mats,prelit in getattr(self,'_all_geoms',[]):
-            old_v,old_n,old_u,old_t,old_m,old_p = (
-                self._vertices,self._normals,self._uvs,
-                self._triangles,self._materials,self._prelit)
-            self._vertices=verts; self._normals=norms; self._uvs=uvs
-            self._triangles=tris; self._materials=mats; self._prelit=prelit
-            if   self._mode=='wireframe': self._draw_wireframe()
-            elif self._mode=='solid':     self._draw_solid()
-            elif self._mode=='textured':  self._draw_textured()
-            (self._vertices,self._normals,self._uvs,
-             self._triangles,self._materials,self._prelit) = (old_v,old_n,old_u,old_t,old_m,old_p)
-
-    def set_prelight(self, v: bool): #vers 1
-        self._use_prelight = v; self.update()
-
-    def set_light_dir(self, x, y, z): #vers 1
-        self._light_dir = (x, y, z, 0.0)
-        if OPENGL_AVAILABLE and self.isVisible():
-            self.makeCurrent()
-            glLightfv(GL_LIGHT0, GL_POSITION, self._light_dir)
-            self.doneCurrent()
-        self.update()
-
-    def set_ambient(self, v: float): #vers 1
-        self._ambient = v
-        if OPENGL_AVAILABLE and self.isVisible():
-            self.makeCurrent()
-            glLightfv(GL_LIGHT0, GL_AMBIENT, [v,v,v,1.0])
-            self.doneCurrent()
-        self.update()
-
-    def set_diffuse(self, v: float): #vers 1
-        self._diffuse = v
-        if OPENGL_AVAILABLE and self.isVisible():
-            self.makeCurrent()
-            glLightfv(GL_LIGHT0, GL_DIFFUSE, [v,v,v,1.0])
-            self.doneCurrent()
-        self.update()
-
-    def reset_camera(self): #vers 1
-        self._yaw=45.0; self._pitch=25.0; self._pan_x=0.0; self._pan_y=0.0
-        self._auto_fit()
-
-
-    # - mouse
-    def mousePressEvent(self, event): #vers 1
-        self._last_pos = event.pos(); self._dragging=True; self._drag_btn=event.button()
-
-    def mouseMoveEvent(self, event): #vers 1
-        if not self._dragging: return
-        dx = event.pos().x()-self._last_pos.x()
-        dy = event.pos().y()-self._last_pos.y()
-        if self._drag_btn == Qt.MouseButton.LeftButton:
-            self._yaw   += dx*0.5
-            self._pitch  = max(-89, min(89, self._pitch+dy*0.5))
-        elif self._drag_btn == Qt.MouseButton.MiddleButton:
-            s = self._dist/500.0
-            self._pan_x += dx*s; self._pan_y -= dy*s
-        self._last_pos = event.pos(); self.update()
-
-    def mouseReleaseEvent(self, event): #vers 1
-        self._dragging=False; self._drag_btn=Qt.MouseButton.NoButton
-
-    def wheelEvent(self, event): #vers 1
-        f = 0.88 if event.angleDelta().y()>0 else 1.13
-        self._dist = max(0.1, min(50000.0, self._dist*f)); self.update()
-
+# DFFViewport imported from apps.methods.dff_viewport
 
 # - Main workshop widget (RadarWorkshop pattern)
-class ModelViewer(ToolMenuMixin, QWidget):
+class ModelViewer(RibbonMixin, ToolMenuMixin, QWidget):
     """Model Viewer — RadarWorkshop UI template with DFFViewport canvas."""
 
     workshop_closed = pyqtSignal()
     window_closed   = pyqtSignal()
+
+    _ribbon_name = "model_viewer"
+    _RIBBON_LAYOUT_VERSION = 1     # 1 = File / Tools ribbons
 
     def _build_menus_into_qmenu(self, pm): #vers 1
         fm = pm.addMenu("File")
@@ -928,7 +422,9 @@ class ModelViewer(ToolMenuMixin, QWidget):
         self.viewport = DFFViewport()
         self.viewport.app_settings = self.app_settings
 
-        main_layout.addWidget(self._create_toolbar())
+        self._tb_frame = self._create_toolbar()
+        self._tb_frame.setVisible(self.standalone_mode)   # title / window buttons only
+        main_layout.addWidget(self._tb_frame)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._create_left_panel())
@@ -938,8 +434,28 @@ class ModelViewer(ToolMenuMixin, QWidget):
         splitter.setStretchFactor(1, 5)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([200, 800, 180])
-        main_layout.addWidget(splitter, 1)
+        main_layout.addWidget(self.ribbon_wrap(splitter), 1)
+        self._build_ribbons()
         main_layout.addWidget(self._create_status_bar())
+        self.ribbon_restore_state()
+
+    def _build_ribbons(self): #vers 1
+        """File and Tools ribbons (moved out of the old title bar)."""
+        from PyQt6.QtWidgets import QToolButton
+        B = self.ribbon_button
+        tb = self.ribbon_toolbar("File")
+        self.open_dff_btn = B(tb, "open_icon", "Open DFF model (Ctrl+O)", self._open_dff, text="DFF")
+        self.open_txd_btn = B(tb, "texture_icon", "Open TXD textures", self._open_txd, text="TXD")
+        tb = self.ribbon_toolbar("Tools")
+        mb = QToolButton()
+        mb.setText("Menu"); mb.setMinimumHeight(self._RIBBON_BTN)
+        mb.setToolTip("Viewer menus"); mb.clicked.connect(self._on_menu_btn_clicked)
+        tb.addWidget(mb)
+        self.menu_toggle_btn = mb
+        self.settings_btn = B(tb, "settings_icon", "Viewer Settings", self._show_workshop_settings, text="Set")
+        self.info_radar_btn = B(tb, "info_icon", "About Model Viewer", self._show_about, text="i")
+        self.properties_btn = B(tb, "properties_icon", "Theme / App Settings", self._open_app_settings, text="Th")
+
 
 
     # - toolbar
@@ -987,20 +503,6 @@ class ModelViewer(ToolMenuMixin, QWidget):
             b.clicked.connect(cb)
             return b
 
-        # Menu | Settings
-        self.menu_toggle_btn = QPushButton("Menu")
-        self.menu_toggle_btn.setFont(self.button_font)
-        self.menu_toggle_btn.setFixedHeight(28)
-        ico = _icon('menu')
-        if ico: self.menu_toggle_btn.setIcon(ico); self.menu_toggle_btn.setIconSize(QSize(16,16))
-        self.menu_toggle_btn.clicked.connect(self._on_menu_btn_clicked)
-        lay.addWidget(self.menu_toggle_btn)
-
-        self.settings_btn = _ibtn("Viewer Settings", self._show_workshop_settings, 'settings')
-        lay.addWidget(self.settings_btn)
-
-        lay.addSpacing(4)
-
         # → title (draggable centre area) →
         self._title_lbl = QLabel(App_name)
         self._title_lbl.setFont(self.title_font)
@@ -1010,21 +512,8 @@ class ModelViewer(ToolMenuMixin, QWidget):
         lay.addWidget(self._title_lbl)
         lay.addStretch()
 
-        # Open DFF | Open TXD
-        self.open_dff_btn = _tbtn("Open DFF", "Open DFF model (Ctrl+O)", self._open_dff, 'open')
-        self.open_txd_btn = _tbtn("Open TXD", "Open TXD textures",       self._open_txd, 'open')
-        lay.addWidget(self.open_dff_btn)
-        lay.addWidget(self.open_txd_btn)
-
-        lay.addSpacing(4)
-
         # ⓘ ⚙ − □ ✕  (standalone only)
         if self.standalone_mode:
-            self.info_radar_btn = _ibtn("About Model Viewer", self._show_about,         'info')
-            self.properties_btn = _ibtn("Theme / App Settings", self._open_app_settings,'properties')
-            lay.addWidget(self.info_radar_btn)
-            lay.addWidget(self.properties_btn)
-
             lay.addSpacing(4)
             self.minimize_btn = QPushButton(); self.minimize_btn.setFixedSize(32,28)
             self.maximize_btn = QPushButton(); self.maximize_btn.setFixedSize(32,28)
@@ -1202,10 +691,11 @@ class ModelViewer(ToolMenuMixin, QWidget):
         swatch_lay = QHBoxLayout(swatch_row)
         swatch_lay.setContentsMargins(0,0,0,0); swatch_lay.setSpacing(4)
 
-        self._paint1_btn = QPushButton("Primary")
-        self._paint2_btn = QPushButton("Secondary")
+        self._paint1_btn = QPushButton("Pri")
+        self._paint2_btn = QPushButton("Sec")
+        self._paint1_btn.setToolTip("Primary paint colour"); self._paint2_btn.setToolTip("Secondary paint colour")
         for btn in (self._paint1_btn, self._paint2_btn):
-            btn.setFixedHeight(28)
+            btn.setFixedHeight(28); btn.setMinimumWidth(50)
             btn.setFont(self.infobar_font)
         self._paint1_btn.clicked.connect(self._pick_paint1)
         self._paint2_btn.clicked.connect(self._pick_paint2)
@@ -1646,14 +1136,54 @@ class ModelViewer(ToolMenuMixin, QWidget):
         finally:
             self._show_progress(False)
 
-    def _collect_needed_textures(self): #vers 1
-        """Return set of texture names the current DFF needs."""
+    def _strip_tex_suffix(self, name: str) -> str: #vers 2
+        """Strip GTA texture suffix.
+        Handles: buildrt4_fehihwm (alpha suffix) and vehiclegeneric256 (numeric size suffix)."""
+        n = re.sub(r'_[a-z]{4,8}$', '', name)
+        n = re.sub(r'\d+$', '', n)
+        return n
+
+    def _get_ide_db(self): #vers 1
+        """Return IDEDatabase from mw.ide_db if loaded, else None."""
+        mw = getattr(self, 'main_window', None)
+        db = getattr(mw, 'ide_db', None)
+        if db and getattr(db, '_loaded', False) and db.model_map:
+            return db
+        db2 = getattr(getattr(mw, 'dat_browser', None), '_ide_db', None)
+        if db2 and db2.model_map:
+            return db2
+        return None
+
+    def _lookup_txd_for_stem(self, stem: str) -> str: #vers 1
+        """Return txd_name from IDE DB for model stem, or empty string."""
+        db = self._get_ide_db()
+        if not db:
+            return ''
+        obj = db.model_map.get(stem.lower())
+        if obj:
+            return obj.txd_name.lower()
+        # Try stripped stem
+        base = self._strip_tex_suffix(stem.lower())
+        if base != stem.lower():
+            obj = db.model_map.get(base)
+            if obj:
+                return obj.txd_name.lower()
+        return ''
+
+    def _collect_needed_textures(self): #vers 2
+        """Return set of texture names the current DFF needs.
+        Stores both full name and suffix-stripped base for fuzzy matching."""
         if not self._dff_model: return set()
         needed = set()
         for g in self._dff_model.geometries:
             for mat in g.materials:
                 name = (mat.texture_name or '').strip().lower()
-                if name: needed.add(name)
+                if not name:
+                    continue
+                needed.add(name)
+                base = self._strip_tex_suffix(name)
+                if base != name:
+                    needed.add(base)
         return needed
 
     def _upload_txd_additive(self, path: str): #vers 1
@@ -1675,23 +1205,30 @@ class ModelViewer(ToolMenuMixin, QWidget):
                 from OpenGL.GL import (glGenTextures, glBindTexture, GL_TEXTURE_2D,
                     glTexParameteri, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR,
                     GL_TEXTURE_MAG_FILTER, GL_LINEAR, GL_TEXTURE_WRAP_S,
-                    GL_TEXTURE_WRAP_T, GL_REPEAT, glTexImage2D, GL_RGBA,
-                    GL_UNSIGNED_BYTE, glGenerateMipmap, glDeleteTextures)
+                    GL_TEXTURE_WRAP_T, GL_REPEAT, GL_CLAMP_TO_EDGE, GL_MIRRORED_REPEAT,
+                    glTexImage2D, GL_RGBA, GL_UNSIGNED_BYTE, glGenerateMipmap, glDeleteTextures)
+                def _rw_wrap(rw):
+                    if rw == 2: return GL_CLAMP_TO_EDGE
+                    if rw == 3: return GL_MIRRORED_REPEAT
+                    return GL_REPEAT
                 for t in new_textures:
                     name = t['name'].lower()
                     rgba = t.get('rgba_data', b'')
                     w = t.get('width', 0); h = t.get('height', 0)
                     if not (rgba and w > 0 and h > 0): continue
+                    wrap_s = _rw_wrap(t.get('wrap_u', 1))
+                    wrap_t = _rw_wrap(t.get('wrap_v', 1))
                     gl_id = glGenTextures(1)
                     glBindTexture(GL_TEXTURE_2D, gl_id)
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_s)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_t)
                     try:
                         glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,rgba)
                         glGenerateMipmap(GL_TEXTURE_2D)
                         self.viewport._tex_ids[name] = gl_id
+                        self.viewport._tex_wrap[name] = (t.get('wrap_u',1), t.get('wrap_v',1))
                     except Exception:
                         glDeleteTextures(1,[gl_id])
                 self.viewport.doneCurrent()
@@ -1735,22 +1272,41 @@ class ModelViewer(ToolMenuMixin, QWidget):
                 p = os.path.dirname(p)
         return ''
 
-    def _auto_load_shared_txds(self): #vers 3
-        """Find shared TXDs in a background thread — never blocks the UI."""
+    def _auto_load_shared_txds(self): #vers 4
+        """Find shared TXDs — uses preloaded cache first, worker for remainder."""
         if not self._dff_model: return
         needed  = self._collect_needed_textures()
         already = set(self.viewport._tex_ids.keys())
         missing = needed - already
         if not missing: return
 
+        # Step 0: Use preloaded shared cache from DAT Browser (instant, no worker)
+        mw = getattr(self, 'main_window', None)
+        preloaded = getattr(mw, 'shared_vehicle_textures', {})
+        if preloaded:
+            hits = []
+            for name in list(missing):
+                t = preloaded.get(name)
+                if not t: t = preloaded.get(self._strip_tex_suffix(name))
+                if t: hits.append(t); missing.discard(name); missing.discard(self._strip_tex_suffix(name))
+            if hits:
+                self.viewport._upload_textures(hits, additive=True)
+                self.viewport.update()
+                self.log(f"+{len(hits)} shared textures loaded")
+            if not missing: return
+
         # Snapshot everything the worker needs — no shared mutable state
         game_root  = self._find_game_root()
         dff_dir    = os.path.dirname(self._current_dff_path) if self._current_dff_path else ''
         dff_stem   = os.path.splitext(os.path.basename(self._current_dff_path))[0].lower() if self._current_dff_path else ''
         img        = getattr(self, '_current_img', None)
+        ide_txd    = self._lookup_txd_for_stem(dff_stem)  # from IDE DB
+        _ide_db    = self._get_ide_db()
+        game_ver   = getattr(_ide_db, '_game', None) or getattr(_ide_db, 'game', 'vc')
 
         from PyQt6.QtCore import QThread, pyqtSignal as _sig
 
+        strip_suffix = self._strip_tex_suffix
         viewer_ref = self
 
         class _Worker(QThread):
@@ -1761,35 +1317,80 @@ class ModelViewer(ToolMenuMixin, QWidget):
                 from apps.methods.txd_parser import parse_txd
                 import tempfile
                 collected = []
+                
                 miss = set(missing)  # local copy
+                # Build suffix-stripped alias map: base_name -> full_name
+                # so we can match TXD textures against suffixed DFF names
+                alias = {}
+                for n in list(miss):
+                    base = strip_suffix(n)
+                    if base != n:
+                        alias[base] = n  # base -> suffixed
 
                 def _try_txd_data(data):
                     nonlocal miss
                     try:
                         textures = parse_txd(data)
-                        hits = [t for t in textures if t['name'].lower() in miss
-                                and t.get('rgba_data') and t['width']>0]
+                        hits = []
+                        for t in textures:
+                            tname = t['name'].lower()
+                            if not (t.get('rgba_data') and t['width'] > 0):
+                                continue
+                            if tname in miss:
+                                hits.append(t)
+                            elif tname in alias:
+                                # TXD has base name, DFF used suffixed name
+                                # Serve texture under the suffixed name the DFF expects
+                                t2 = dict(t); t2['name'] = alias[tname]
+                                hits.append(t2)
+                                hits.append(t)  # also store base for future lookups
                         if hits:
                             collected.extend(hits)
-                            miss -= {t['name'].lower() for t in hits}
+                            for t in hits:
+                                miss.discard(t['name'].lower())
                         return len(hits)
                     except Exception:
                         return 0
 
-                # 0. models/generic/
+                # 0. Shared TXDs from models/ — game-version aware
+                # GTA3/LC: models/generic.txd, models/Generic/wheels.DFF
+                # VC:      models/generic.txd, models/Generic/wheels.DFF
+                # SA:      models/generic/vehicle.txd, models/generic/wheels.txd, models/generic/wheels.DFF
                 if game_root:
-                    generic = os.path.join(game_root,'models','generic')
-                    for fn in ('vehicle.txd','wheels.txd','vehiclecommon.txd'):
-                        p = os.path.join(generic, fn)
+                    m = os.path.join(game_root, 'models')
+                    if game_ver == 'sa':
+                        shared_txds = [
+                            os.path.join(m, 'generic', 'vehicle.txd'),
+                            os.path.join(m, 'generic', 'wheels.txd'),
+                        ]
+                        wheel_dffs = [
+                            os.path.join(m, 'generic', 'wheels.DFF'),
+                            os.path.join(m, 'generic', 'wheels.dff'),
+                        ]
+                    else:
+                        # GTA3 / VC / LC: generic.txd + misc.txd in models/, wheels.DFF in models/Generic/
+                        shared_txds = [
+                            os.path.join(m, 'generic.txd'),
+                            os.path.join(m, 'particle.txd'),
+                            os.path.join(m, 'misc.txd'),
+                            os.path.join(m, 'MISC.TXD'),
+                            os.path.join(m, 'wheels.txd'),
+                            os.path.join(m, 'wheels.TXD'),
+                        ]
+                        wheel_dffs = [
+                            os.path.join(m, 'Generic', 'wheels.DFF'),
+                            os.path.join(m, 'Generic', 'wheels.dff'),
+                            os.path.join(m, 'generic', 'wheels.DFF'),
+                            os.path.join(m, 'generic', 'wheels.dff'),
+                        ]
+                    for p in shared_txds:
                         if os.path.isfile(p) and miss:
                             try:
-                                with open(p,'rb') as f: _try_txd_data(f.read())
+                                with open(p, 'rb') as f: _try_txd_data(f.read())
                             except Exception: pass
-                    # Store wheels.DFF path for assembly use
-                    for wfn in ('wheels.DFF','wheels.dff'):
-                        wp=os.path.join(generic,wfn)
+                    for wp in wheel_dffs:
                         if os.path.isfile(wp):
-                            viewer_ref._wheels_model_path=wp; break
+                            viewer_ref._wheels_model_path = wp; break
                     if not miss:
                         if collected: self.found.emit(collected)
                         return
@@ -1805,6 +1406,18 @@ class ModelViewer(ToolMenuMixin, QWidget):
                                 with open(os.path.join(dff_dir,fn),'rb') as f: _try_txd_data(f.read())
                             except Exception: pass
                     except Exception: pass
+
+                # 1a. IDE DB lookup — exact TXD name from parsed IDE files
+                if miss and img and hasattr(img, 'entries') and ide_txd:
+                    txd_key = ide_txd if ide_txd.endswith('.txd') else ide_txd + '.txd'
+                    txd_map = {e.name.lower(): e for e in img.entries if e.name.lower().endswith('.txd')}
+                    entry = txd_map.get(txd_key)
+                    if entry:
+                        self.status.emit(f'IDE: loading {txd_key}...')
+                        try:
+                            data = img.read_entry_data(entry)
+                            if data: _try_txd_data(data)
+                        except Exception: pass
 
                 # 1b. Current IMG (gta3.img) — look for vehicle*.txd entries
                 # SA stores vehiclegeneric256 etc inside gta3.img as separate TXDs
@@ -1869,7 +1482,7 @@ class ModelViewer(ToolMenuMixin, QWidget):
         # Filter already-loaded
         new = [t for t in textures if t['name'].lower() not in self.viewport._tex_ids]
         if not new: return
-        self.viewport._upload_textures(new)
+        self.viewport._upload_textures(new, additive=True)
         # Add to tex list
         from PyQt6.QtGui import QIcon, QImage, QPixmap
         from PyQt6.QtWidgets import QListWidgetItem
@@ -1933,9 +1546,14 @@ class ModelViewer(ToolMenuMixin, QWidget):
         self._img_list.clear()
         if not img or not hasattr(img, 'entries'):
             return
+        import re as _re
+        def _clean(name):
+            stem, ext = os.path.splitext(name)
+            stem = _re.sub(r'_[a-z0-9]{6,12}$', '', stem, flags=_re.IGNORECASE)
+            return stem + ext
         for entry in img.entries:
             if entry.name.lower().endswith('.dff'):
-                item = QListWidgetItem(entry.name)
+                item = QListWidgetItem(_clean(entry.name))
                 item.setData(Qt.ItemDataRole.UserRole, entry)
                 self._img_list.addItem(item)
         count = self._img_list.count()
@@ -2004,11 +1622,19 @@ class ModelViewer(ToolMenuMixin, QWidget):
                 if fn: name = fn
             self._geom_list.addItem(f"[{i}] {name}  {len(g.vertices)}v {len(g.triangles)}t")
 
-    def _on_geom_selected(self, row: int): #vers 1
+    def _on_geom_selected(self, row: int): #vers 2
         if not self._dff_model or row < 0 or row >= len(self._dff_model.geometries): return
         self._current_geom = row
-        g = self._dff_model.geometries[row]
-        self.viewport.load_geometry(g, g.materials)
+        m = self._dff_model
+        g = m.geometries[row]
+        if m.frames and m.atomics:
+            self.viewport.load_all_geometries(
+                m.geometries, [geom.materials for geom in m.geometries],
+                m.frames, m.atomics)
+            if not getattr(self.viewport, '_all_geoms', None) and not self.viewport._vertices:
+                self.viewport.load_geometry(g, g.materials)
+        else:
+            self.viewport.load_geometry(g, g.materials)
         has_prelit = bool(g.colors)
         self._prelit_btn.setEnabled(has_prelit)
         self._info_lbl.setText(
@@ -2026,7 +1652,9 @@ class ModelViewer(ToolMenuMixin, QWidget):
 
 
     # - window chrome (from RadarWorkshop)
-    def _get_resize_corner(self, pos): #vers 1
+    def _get_resize_corner(self, pos): #vers 2
+        if not self.standalone_mode:           # docked: no corner resize
+            return None
         s=self.corner_size; w=self.width(); h=self.height()
         if pos.x()<s and pos.y()<s:           return "top-left"
         if pos.x()>w-s and pos.y()<s:         return "top-right"
@@ -2243,7 +1871,8 @@ class ModelViewer(ToolMenuMixin, QWidget):
         if hasattr(self,'size_grip'): self.size_grip.move(self.width()-16,self.height()-16)
         self._refresh_corner_overlay()
 
-    def closeEvent(self, event): #Vers 2
+    def closeEvent(self, event): #Vers 3
+        self.ribbon_save_state()
         # Save window geometry
         if self.standalone_mode:
             g = self.geometry()
